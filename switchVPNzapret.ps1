@@ -21,18 +21,23 @@ param(
     [switch]$TestOnce
 )
 
+$ErrorActionPreference = 'Stop'
+
 # ---------------------- НАСТРОЙКИ ----------------------
 # Имена/описания VPN-адаптеров (поддерживаются wildcard-маски).
 # Проверить своё можно так (при включённом VPN):
-#   Get-NetAdapter | Format-Table Name, InterfaceDescription, Status
+#   Get-NetAdapter -IncludeHidden | Format-Table Name, InterfaceDescription, Status
 $VpnAdapterPatterns = @(
     'Happ*',           # Happ TUN
     '*Happ*',          # на всякий — если имя смешанное
     'FlClashX*',       # FlClashX TUN
+    '*FlClash*',
     'wintun*',         # универсальный wintun (WireGuard, Mullvad и т.п.)
+    '*wintun*',
     'TAP-Windows*',    # OpenVPN TAP
     'OpenVPN*',
-    'WireGuard*'
+    'WireGuard*',
+    '*WireGuard*'
 )
 
 $ServiceName = 'zapret'
@@ -58,7 +63,7 @@ if (-not $createdNew) {
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
-function Write-Log {
+function global:Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
     try {
         if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt $MaxLogBytes)) {
@@ -84,33 +89,100 @@ Write-Log "=== switchVPNzapret запущен (PID $PID, user=$([Environment]::U
 # Основные функции
 # ======================================================
 
-function Test-VpnUp {
+function global:Test-VpnUp {
+    # ВАЖНО: TUN-адаптеры Happ/wintun часто помечены как Hidden и БЕЗ -IncludeHidden
+    # Get-NetAdapter их не показывает → VPN не детектится. Поэтому всегда -IncludeHidden.
+    $up = $null
     try {
-        $up = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+        $up = Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' }
     } catch {
-        # На случай старых систем — fallback через WMI.
-        $up = Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -ErrorAction SilentlyContinue |
-              Where-Object { $_.MediaConnectState -eq 1 }
+        # На случай старых систем / отсутствия модуля — fallback через WMI.
+        try {
+            $up = Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -ErrorAction Stop |
+                  Where-Object { $_.MediaConnectState -eq 1 -or $_.InterfaceOperationalStatus -eq 1 }
+        } catch {
+            Write-Log "Не удалось получить список адаптеров: $($_.Exception.Message)" 'WARN'
+            return $false
+        }
     }
     if (-not $up) { return $false }
 
     foreach ($p in $VpnAdapterPatterns) {
-        if ($up | Where-Object { $_.Name -like $p -or $_.InterfaceDescription -like $p }) {
-            return $true
+        foreach ($a in $up) {
+            # У MSFT_NetAdapter свойство называется Name/InterfaceDescription — оба проверяем.
+            $name = $a.Name
+            $desc = $a.InterfaceDescription
+            if (($name -and ($name -like $p)) -or ($desc -and ($desc -like $p))) {
+                Write-Log "Обнаружен VPN-адаптер: '$name' / '$desc' (по маске '$p')." 'DEBUG'
+                return $true
+            }
         }
     }
     return $false
 }
 
-function Stop-Zapret {
-    # 1) Останавливаем службу через sc.exe (быстрее и тише Stop-Service).
+function global:Get-WinwsProcesses {
+    # Централизованно: получить все процессы winws (может быть несколько).
+    return @(Get-Process -Name winws -ErrorAction SilentlyContinue)
+}
+
+function global:Kill-Winws {
+    <#
+      Надёжно убивает winws.exe.
+      Главная причина, по которой "winws.exe продолжает висеть":
+      winws.exe запущен службой zapret, но сам НЕ является корректной службой —
+      он не обрабатывает SERVICE_CONTROL_STOP, поэтому `sc stop zapret` вешает
+      службу в STOP_PENDING, а процесс не умирает. Добиваем принудительно,
+      с деревом процессов (/T) и повторами.
+    #>
+    $killed = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $procs = Get-WinwsProcesses
+        if ($procs.Count -eq 0) {
+            return $true  # уже мёртв
+        }
+
+        foreach ($p in $procs) {
+            # 1) taskkill /T /F — убивает процесс ВМЕСТЕ с деревом дочерних.
+            try {
+                $null = & taskkill.exe /PID $p.Id /T /F 2>&1
+            } catch { }
+        }
+
+        Start-Sleep -Milliseconds 400
+
+        # 2) Если что-то ещё живо — добиваем через .NET Kill() по PID.
+        foreach ($p in (Get-WinwsProcesses)) {
+            try {
+                $p.Kill()
+            } catch { }
+        }
+
+        Start-Sleep -Milliseconds 300
+
+        if ((Get-WinwsProcesses).Count -eq 0) {
+            $killed = $true
+            break
+        }
+        Write-Log "winws.exe ещё жив после попытки $attempt — повторяю." 'WARN'
+    }
+
+    if (-not $killed -and (Get-WinwsProcesses).Count -gt 0) {
+        Write-Log "НЕ удалось убить winws.exe после 5 попыток." 'ERROR'
+    }
+    return $killed
+}
+
+function global:Stop-Zapret {
+    # 1) Останавливаем службу через sc.exe (неблокирующе — не ждём Stopped бесконечно,
+    #    т.к. winws как служба часто виснет в STOP_PENDING).
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($svc) {
         try {
             $null = & sc.exe stop $ServiceName 2>&1
-            # ждём максимум 5 секунд
-            for ($i = 0; $i -lt 10; $i++) {
-                $svc.Refresh()
+            # Короткое ожидание — максимум 2.5 сек. Не зацикливаемся на StopPending.
+            for ($i = 0; $i -lt 5; $i++) {
+                try { $svc.Refresh() } catch { }
                 if ($svc.Status -eq 'Stopped') { break }
                 Start-Sleep -Milliseconds 500
             }
@@ -119,17 +191,21 @@ function Stop-Zapret {
         }
     }
 
-    # 2) Добиваем winws.exe — на случай, если zapret запускался standalone-батником.
-    Get-Process -Name winws -ErrorAction SilentlyContinue | ForEach-Object {
-        try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch { }
-    }
+    # 2) ГЛАВНОЕ: принудительно добиваем winws.exe (с деревом процессов и повторами).
+    #    Именно этот шаг чинит баг "winws.exe продолжает висеть".
+    Kill-Winws | Out-Null
 
-    Write-Log "VPN поднят → zapret остановлен."
+    # 3) Контрольная проверка.
+    if ((Get-WinwsProcesses).Count -eq 0) {
+        Write-Log "VPN поднят → zapret остановлен, winws.exe убит."
+    } else {
+        Write-Log "VPN поднят → sc stop выполнен, но winws.exe всё ещё в памяти!" 'ERROR'
+    }
 }
 
-function Start-Zapret {
+function global:Start-Zapret {
     # Если уже крутится — ничего не делаем.
-    if (Get-Process -Name winws -ErrorAction SilentlyContinue) {
+    if ((Get-WinwsProcesses).Count -gt 0) {
         Write-Log "winws уже работает — пропускаю старт." 'DEBUG'
         return
     }
@@ -139,13 +215,16 @@ function Start-Zapret {
     if ($svc) {
         try {
             $null = & sc.exe start $ServiceName 2>&1
-            Start-Sleep -Milliseconds 800
-            $svc.Refresh()
-            if ($svc.Status -eq 'Running' -or $svc.Status -eq 'StartPending') {
-                Write-Log "VPN отключён → zapret запущен (service)."
-                return
+            # Ждём до ~4 сек появления winws.exe (служба стартует процесс асинхронно).
+            for ($i = 0; $i -lt 8; $i++) {
+                Start-Sleep -Milliseconds 500
+                if ((Get-WinwsProcesses).Count -gt 0) {
+                    Write-Log "VPN отключён → zapret запущен (service)."
+                    return
+                }
+                try { $svc.Refresh() } catch { }
             }
-            Write-Log "sc start ${ServiceName} вернул статус $($svc.Status)." 'WARN'
+            Write-Log "sc start ${ServiceName}: winws.exe не появился за 4 сек (статус $($svc.Status)). Пробую fallback." 'WARN'
         } catch {
             Write-Log "sc start ${ServiceName} упал: $($_.Exception.Message)" 'WARN'
         }
@@ -154,9 +233,10 @@ function Start-Zapret {
     }
 
     # 2) Fallback — ищем general.bat рядом со скриптом, в стандартных местах, иначе — $GeneralBatFallback.
+    $scriptDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { $PSScriptRoot }
     $candidates = @(
-        (Join-Path (Split-Path -Parent $PSCommandPath) 'general.bat'),
-        (Join-Path (Split-Path -Parent $PSCommandPath) 'zapret\general.bat'),
+        (Join-Path $scriptDir 'general.bat'),
+        (Join-Path $scriptDir 'zapret\general.bat'),
         $GeneralBatFallback
     ) | Where-Object { $_ -and (Test-Path $_) }
 
@@ -182,17 +262,42 @@ function Start-Zapret {
     }
 }
 
-function Sync-State {
-    # Главная «петля»: сравнить желаемое состояние с текущим.
-    $vpnUp = Test-VpnUp
-    $winwsRunning = [bool](Get-Process -Name winws -ErrorAction SilentlyContinue)
+# --- Сериализация Sync-State: защита от гонки WMI-событие vs таймер ---
+# Оба источника могут дёрнуть Sync-State одновременно → два sc stop/start подряд.
+# Простой флаг + Interlocked гарантирует, что одновременно работает только один проход.
+# ВАЖНО: лок обязан быть ГЛОБАЛЬНЫМ — Action-блоки событий (WMI/таймер) выполняются
+# в отдельном контексте, где переменные уровня $script: НЕ видны (проверено).
+# С $script: лок был бы $null и CompareExchange упал бы с ошибкой.
+$global:SwitchVpnSyncLock = [ref]0
 
-    if ($vpnUp -and $winwsRunning) {
-        Stop-Zapret
-    } elseif (-not $vpnUp -and -not $winwsRunning) {
-        Start-Zapret
+function global:Sync-State {
+    # Если уже идёт проход — выходим (другой поток доделает актуальное состояние).
+    if ([System.Threading.Interlocked]::CompareExchange($global:SwitchVpnSyncLock, 1, 0) -ne 0) {
+        return
     }
-    # Иначе — уже в нужном состоянии, ничего не делаем.
+    try {
+        # Главная «петля»: сравнить желаемое состояние с текущим.
+        $vpnUp = Test-VpnUp
+        $winwsRunning = ((Get-WinwsProcesses).Count -gt 0)
+
+        if ($vpnUp -and $winwsRunning) {
+            Stop-Zapret
+        } elseif ($vpnUp -and -not $winwsRunning) {
+            # VPN поднят, winws не бежит — но служба zapret могла остаться в auto и
+            # способна перезапустить процесс. На всякий случай убеждаемся, что служба стоит.
+            $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Stopped') {
+                Write-Log "VPN поднят, winws не бежит, но служба в статусе $($svc.Status) — останавливаю." 'DEBUG'
+                Stop-Zapret
+            }
+        } elseif (-not $vpnUp -and -not $winwsRunning) {
+            Start-Zapret
+        }
+        # Иначе (VPN down + winws running) — корректное рабочее состояние, ничего не делаем.
+    }
+    finally {
+        [System.Threading.Interlocked]::Exchange($global:SwitchVpnSyncLock, 0) | Out-Null
+    }
 }
 
 # ======================================================
@@ -200,7 +305,11 @@ function Sync-State {
 # ======================================================
 if ($TestOnce) {
     Sync-State
-    Write-Log "TestOnce завершён. VPN=$(Test-VpnUp)  winws=$([bool](Get-Process -Name winws -ErrorAction SilentlyContinue))"
+    $vpn = Test-VpnUp
+    $winws = ((Get-WinwsProcesses).Count -gt 0)
+    Write-Log "TestOnce завершён. VPN=$vpn  winws=$winws"
+    Write-Host "TestOnce: VPN=$vpn  winws=$winws  (подробности в $LogFile)"
+    if ($mutex) { try { $mutex.ReleaseMutex() } catch {}; $mutex.Dispose() }
     exit 0
 }
 
@@ -212,12 +321,15 @@ if ($TestOnce) {
 Sync-State
 
 # Подписываемся на изменения сетевых адаптеров (событие приходит мгновенно).
+# ПРИМЕЧАНИЕ: PreviousInstance в __InstanceModificationEvent для MSFT_NetAdapter
+# в namespace root/StandardCimv2 поддерживается не на всех системах и ломает запрос.
+# Поэтому ловим ЛЮБУЮ модификацию адаптера, а решение принимает Sync-State (идемпотентно).
 $query = @"
 SELECT * FROM __InstanceModificationEvent WITHIN 2
 WHERE TargetInstance ISA 'MSFT_NetAdapter'
-  AND TargetInstance.MediaConnectState <> PreviousInstance.MediaConnectState
 "@
 
+$wmiRegistered = $false
 try {
     Register-CimIndicationEvent -Namespace 'root/StandardCimv2' -Query $query `
         -SourceIdentifier 'VpnAdapterChange' -Action {
@@ -227,20 +339,42 @@ try {
                 Sync-State
             } catch { }
         } | Out-Null
+    $wmiRegistered = $true
     Write-Log "Подписка на WMI MSFT_NetAdapter оформлена."
 } catch {
-    Write-Log "Не удалось подписаться на WMI: $($_.Exception.Message). Останется только таймер." 'WARN'
+    Write-Log "Не удалось подписаться на WMI (StandardCimv2): $($_.Exception.Message). Пробую root/cimv2." 'WARN'
+    # Fallback на классический Win32_NetworkAdapter (есть на всех системах).
+    try {
+        $query2 = @"
+SELECT * FROM __InstanceModificationEvent WITHIN 2
+WHERE TargetInstance ISA 'Win32_NetworkAdapter'
+"@
+        Register-CimIndicationEvent -Namespace 'root/cimv2' -Query $query2 `
+            -SourceIdentifier 'VpnAdapterChange' -Action {
+                try {
+                    Start-Sleep -Milliseconds 1500
+                    Sync-State
+                } catch { }
+            } | Out-Null
+        $wmiRegistered = $true
+        Write-Log "Подписка на WMI Win32_NetworkAdapter (root/cimv2) оформлена."
+    } catch {
+        Write-Log "Не удалось подписаться и на root/cimv2: $($_.Exception.Message). Останется только таймер." 'WARN'
+    }
 }
 
 # Страховочный таймер — раз в 15 секунд перепроверяем состояние (на случай пропущенных событий).
+# Если WMI не поднялся — ускоряем опрос до 3 секунд, чтобы остаться отзывчивыми.
+$tickMs = if ($wmiRegistered) { 15000 } else { 3000 }
 try {
     $timer = New-Object System.Timers.Timer
-    $timer.Interval  = 15000
+    $timer.Interval  = $tickMs
     $timer.AutoReset = $true
     Register-ObjectEvent -InputObject $timer -EventName Elapsed -SourceIdentifier 'VpnSafetyTick' -Action {
         try { Sync-State } catch { }
     } | Out-Null
     $timer.Start()
+    Write-Log "Страховочный таймер запущен (интервал $tickMs мс)."
 } catch {
     Write-Log "Не удалось запустить таймер-страховку: $($_.Exception.Message)" 'WARN'
 }
@@ -249,8 +383,9 @@ try {
 try {
     while ($true) { Start-Sleep -Seconds 3600 }
 } finally {
+    if ($timer) { try { $timer.Stop(); $timer.Dispose() } catch { } }
     Unregister-Event -SourceIdentifier 'VpnAdapterChange' -ErrorAction SilentlyContinue
     Unregister-Event -SourceIdentifier 'VpnSafetyTick'   -ErrorAction SilentlyContinue
-    if ($mutex) { $mutex.ReleaseMutex() | Out-Null; $mutex.Dispose() }
+    if ($mutex) { try { $mutex.ReleaseMutex() | Out-Null } catch { }; $mutex.Dispose() }
     Write-Log "=== switchVPNzapret завершён ==="
 }
