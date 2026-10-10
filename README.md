@@ -33,6 +33,36 @@
 
 ---
 
+## Что было исправлено (важно)
+
+Ранняя версия скрипта при поднятии VPN (Happ) **не убивала `winws.exe`** — процесс продолжал висеть. Разобрались и починили:
+
+1. **`winws.exe` висел при поднятии VPN (главный баг).**
+   Служба `zapret` запускает `winws.exe` через `binPath`, но сам `winws.exe` **не является корректной Windows-службой** и не реагирует на `SERVICE_CONTROL_STOP`. Поэтому `sc stop zapret` вешал службу в `STOP_PENDING`, а процесс оставался в памяти.
+   → Теперь после `sc stop` процесс **принудительно добивается** через `taskkill /T /F` (вместе с деревом дочерних) + `.NET Kill()`, **с 5 повторами и контрольной проверкой**. Функция `Kill-Winws`.
+
+2. **VPN-адаптер вообще не детектился.**
+   `Get-NetAdapter` без `-IncludeHidden` **не показывает скрытые TUN-адаптеры** (Happ/wintun часто Hidden). Из-за этого `Test-VpnUp` всегда возвращала `false`.
+   → Добавлен `-IncludeHidden` + расширены маски адаптеров.
+
+3. **Гонка WMI-событие ↔ таймер.**
+   Оба источника могли дёрнуть `Sync-State` одновременно → двойной `sc stop`/`sc start`.
+   → Добавлена сериализация через `Interlocked` (одновременно работает только один проход).
+
+4. **Переменные/функции были не видны в обработчиках событий.**
+   Action-блоки `Register-CimIndicationEvent`/`Register-ObjectEvent` выполняются в отдельном scope, где `$script:`-переменные **недоступны** (на Windows PowerShell 5.1 — и функции тоже).
+   → Ключевые функции и лок объявлены в **глобальной** области (`global:`).
+
+5. **WMI-подписка могла не оформиться.**
+   `PreviousInstance` в `__InstanceModificationEvent` для `MSFT_NetAdapter` поддерживается не везде и ломал запрос → оставался только таймер.
+   → Запрос упрощён (ловим любую модификацию, решение принимает идемпотентная `Sync-State`) + **fallback** на `root/cimv2 Win32_NetworkAdapter`. Если WMI не поднялся — таймер ускоряется до 3 сек.
+
+6. **`install_autostart.bat` создавал невалидный XML.**
+   Порядок элементов внутри `<Settings>` **нарушал XSD-схему** Task Scheduler (`RestartOnFailure` в конце, `Priority` не на месте) → `schtasks /Create /XML` падал. Плюс декларация `encoding="UTF-16"` при реальном UTF-8 содержимом.
+   → Порядок приведён к XSD, добавлен `<IdleSettings>`, кодировка исправлена на `UTF-8`.
+
+---
+
 ## Установка (один раз)
 
 1. Положите все файлы (`switchVPNzapret.ps1`, `switchVPNzapret.vbs`, `install_autostart.bat`, `uninstall_autostart.bat`) в удобную папку, например `C:\Tools\switchVPNzapret\`.
@@ -40,8 +70,10 @@
 2. Установите сам `zapret` как сервис: `service.bat` → `1. Install Service` → выбрать нужный `general*.bat`.
 3. Проверьте имена своих VPN-адаптеров (пока VPN **включён**):
    ```powershell
-   Get-NetAdapter | Format-Table Name, InterfaceDescription, Status
+   Get-NetAdapter -IncludeHidden | Format-Table Name, InterfaceDescription, Status
    ```
+   > ⚠ Обязательно с ключом `-IncludeHidden` — TUN-адаптеры Happ / wintun часто
+   > помечены как скрытые, и без него команда (и старая версия скрипта) их не видела.
    Если ваш адаптер называется иначе — поправьте массив `$VpnAdapterPatterns` в начале `switchVPNzapret.ps1`.
 4. **ПКМ по `install_autostart.bat` → «Запуск от имени администратора».**
 5. Готово. Проверить:

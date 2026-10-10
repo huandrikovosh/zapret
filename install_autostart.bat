@@ -45,8 +45,14 @@ schtasks /Delete /TN "%TASK%" /F >nul 2>&1
 echo [*] Создаю XML задачи...
 
 REM Для триггера OnStart принципал SYSTEM. Hidden=true убирает любые всплывающие окна.
+REM encoding=UTF-8: файл пишется echo под chcp 65001; раньше стояло UTF-16 при
+REM UTF-8 содержимом -> schtasks мог падать/кривить парсинг.
+REM Порядок элементов внутри Settings строго задан XSD-схемой Task Scheduler:
+REM AllowStartOnDemand -> RestartOnFailure -> MultipleInstancesPolicy -> ... ->
+REM IdleSettings -> ExecutionTimeLimit -> Enabled -> Hidden -> RunOnlyIfIdle ->
+REM WakeToRun -> Priority. Нарушение порядка -> schtasks /Create /XML падает.
 > "%XML%" (
-    echo ^<?xml version="1.0" encoding="UTF-16"?^>
+    echo ^<?xml version="1.0" encoding="UTF-8"?^>
     echo ^<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"^>
     echo   ^<RegistrationInfo^>
     echo     ^<Description^>Switch zapret off when VPN is up, on when VPN is down.^</Description^>
@@ -65,23 +71,27 @@ REM Для триггера OnStart принципал SYSTEM. Hidden=true уб�
     echo     ^</Principal^>
     echo   ^</Principals^>
     echo   ^<Settings^>
+    echo     ^<AllowStartOnDemand^>true^</AllowStartOnDemand^>
+    echo     ^<RestartOnFailure^>
+    echo       ^<Interval^>PT1M^</Interval^>
+    echo       ^<Count^>999^</Count^>
+    echo     ^</RestartOnFailure^>
     echo     ^<MultipleInstancesPolicy^>IgnoreNew^</MultipleInstancesPolicy^>
     echo     ^<DisallowStartIfOnBatteries^>false^</DisallowStartIfOnBatteries^>
     echo     ^<StopIfGoingOnBatteries^>false^</StopIfGoingOnBatteries^>
     echo     ^<AllowHardTerminate^>true^</AllowHardTerminate^>
     echo     ^<StartWhenAvailable^>true^</StartWhenAvailable^>
     echo     ^<RunOnlyIfNetworkAvailable^>false^</RunOnlyIfNetworkAvailable^>
-    echo     ^<AllowStartOnDemand^>true^</AllowStartOnDemand^>
+    echo     ^<IdleSettings^>
+    echo       ^<StopOnIdleEnd^>false^</StopOnIdleEnd^>
+    echo       ^<RestartOnIdle^>false^</RestartOnIdle^>
+    echo     ^</IdleSettings^>
+    echo     ^<ExecutionTimeLimit^>PT0S^</ExecutionTimeLimit^>
     echo     ^<Enabled^>true^</Enabled^>
     echo     ^<Hidden^>true^</Hidden^>
     echo     ^<RunOnlyIfIdle^>false^</RunOnlyIfIdle^>
     echo     ^<WakeToRun^>false^</WakeToRun^>
-    echo     ^<ExecutionTimeLimit^>PT0S^</ExecutionTimeLimit^>
     echo     ^<Priority^>7^</Priority^>
-    echo     ^<RestartOnFailure^>
-    echo       ^<Interval^>PT1M^</Interval^>
-    echo       ^<Count^>999^</Count^>
-    echo     ^</RestartOnFailure^>
     echo   ^</Settings^>
     echo   ^<Actions Context="Author"^>
     echo     ^<Exec^>
