@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Пока запущен Happ (VPN) — гасит zapret (winws.exe), чтобы Happ не ругался
   на «Conflicting Software». Как только Happ закрыт — снова поднимает zapret
@@ -112,7 +112,7 @@ Write-Log "=== switchVPNzapret запущен (PID $PID, user=$([Environment]::U
 if ($global:ZapretBatPath) {
     Write-Log "Конфиг zapret: $($global:ZapretBatPath)"
 } else {
-    Write-Log "НЕ найден '$($global:GeneralBatName)'. Задайте путь через -GeneralBat или поправьте \$global:GeneralBatFallbacks." 'ERROR'
+    Write-Log ("НЕ найден '{0}'. Задайте путь через -GeneralBat или поправьте `$global:GeneralBatFallbacks." -f $global:GeneralBatName) 'ERROR'
 }
 
 # ======================================================
@@ -213,7 +213,10 @@ function global:Start-Zapret {
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $env:ComSpec                                  # cmd.exe
-        $psi.Arguments = "/c `"`"$($global:ZapretBatPath)`"`""        # /c "C:\...\general (ALT12).bat"
+        # Не используем сложную строку вида "/c `"`"...`"`"": при копировании/перекодировке
+        # именно она чаще всего превращается в синтаксически битый PowerShell.
+        $batForCmd = '"' + $global:ZapretBatPath + '"'
+        $psi.Arguments = '/d /c ' + $batForCmd                         # /d /c "C:\...\general (ALT12).bat"
         $psi.WorkingDirectory = Split-Path -Parent $global:ZapretBatPath
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $psi.CreateNoWindow = $true
