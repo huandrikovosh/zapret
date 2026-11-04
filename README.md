@@ -19,7 +19,7 @@
 | Файл | Что делает |
 |---|---|
 | `switchVPNzapret.ps1` | Основной скрипт. Слушает WMI-события старта/останова процесса `happ.exe` + страховочный таймер. |
-| `switchVPNzapret.vbs` | Невидимый launcher. Запускает PowerShell так, что окно вообще не появляется. |
+| `switchVPNzapret.vbs` | Невидимый launcher. Запускает PowerShell без окна и ждёт его завершения, чтобы задача планировщика была `Running`, пока скрипт жив. |
 | `install_autostart.bat` | Создаёт задачу планировщика `SwitchVPNZapret` (от SYSTEM, при старте ПК, скрыто). |
 | `uninstall_autostart.bat` | Удаляет задачу планировщика. |
 
@@ -27,7 +27,7 @@
 
 ## Как это работает
 
-1. При старте ПК планировщик стартует задачу `SwitchVPNZapret` — она крутит `switchVPNzapret.ps1` в фоне от SYSTEM.
+1. При старте ПК планировщик стартует задачу `SwitchVPNZapret` — она через `switchVPNzapret.vbs` крутит `switchVPNzapret.ps1` в фоне от SYSTEM. Пока скрипт жив, задача в планировщике должна быть `Running` / «Выполняется».
 2. Скрипт сразу приходит в консистентное состояние и дальше **ничего не делает**, пока ничего не меняется.
 3. Как только **запускается процесс `happ.exe`** (WMI-событие `__InstanceCreationEvent`):
    - добивает `winws.exe` принудительно (`taskkill /T /F` + `.NET Kill()`, с повторами и проверкой);
@@ -95,38 +95,242 @@
 
 ---
 
-## Установка (один раз)
+## Установка и проверка для новичка (один раз)
 
-1. Положите все файлы (`switchVPNzapret.ps1`, `switchVPNzapret.vbs`, `install_autostart.bat`, `uninstall_autostart.bat`) в удобную папку, например `C:\Tools\switchVPNzapret\`.
-   > ⚠ Путь **без кириллицы** и **не в OneDrive** — то же правило, что и для самого `zapret`.
-2. Убедитесь, что у вас есть распакованный `zapret` и в нём лежит нужный конфиг **`general (ALT12).bat`** (например `C:\zapret\general (ALT12).bat`).
-   > Отдельно устанавливать zapret как службу **не обязательно** — скрипт сам поднимает zapret через этот батник. Если служба всё же установлена, скрипт её корректно остановит при включении Happ.
-3. **Укажите путь к `general (ALT12).bat`** одним из способов:
-   - **Автопоиск** (ничего делать не нужно), если батник лежит рядом со скриптом, в подпапке `zapret\` рядом со скриптом, или в `C:\zapret\` / `C:\Tools\zapret\`.
-   - Либо впишите путь в `switchVPNzapret.vbs` (переменная `batPath` в начале файла).
-   - Либо поправьте массив `$GeneralBatFallbacks` в начале `switchVPNzapret.ps1`.
-4. Проверьте, что имя процесса Happ — действительно `happ.exe` (при запущенном Happ):
-   ```powershell
-   Get-Process happ | Format-Table Id, ProcessName, Path
+### 0. Что изменено в текущей версии
+
+Раньше могло казаться, что задача «запустилась и сразу закрылась»: `.vbs` запускал PowerShell и сам сразу завершался. Теперь `.vbs` **ждёт PowerShell до конца**, но всё равно делает это скрыто. Поэтому после установки в планировщике задача должна быть **Running / Выполняется**, пока работает фоновый скрипт.
+
+Также исправлена внутренняя блокировка `Sync-State`: из-за некорректного `[ref]` PowerShell мог завершаться на старте. Теперь используется `SemaphoreSlim`.
+
+### 1. Куда положить файлы
+
+1. Создайте папку, например:
+   ```text
+   C:\Tools\switchVPNzapret\
    ```
-   Если у вас другое имя — поправьте массив `$VpnProcessNames` в начале `switchVPNzapret.ps1`.
-5. **ПКМ по `install_autostart.bat` → «Запуск от имени администратора».**
-6. Готово. Проверить:
-   - `schtasks /Query /TN "SwitchVPNZapret" /V /FO LIST` — задача есть, Status = Ready/Running.
-   - Запустите Happ → через 1–2 секунды в диспетчере `winws.exe` **пропадёт**, табличка конфликта больше не появится.
-   - Закройте Happ → через 1–2 секунды `winws.exe` **снова появится** (без мелькания окон).
+2. Положите туда файлы:
+   - `switchVPNzapret.ps1`
+   - `switchVPNzapret.vbs`
+   - `install_autostart.bat`
+   - `uninstall_autostart.bat`
 
-### Проверка вручную без автозагрузки
+Важно: путь лучше делать **без кириллицы**, **без пробелов по возможности** и **не в OneDrive**.
+
+### 2. Где должен лежать zapret
+
+Сам `zapret` должен быть распакован, например, сюда:
+
+```text
+C:\zapret\
+```
+
+Внутри него должен быть файл:
+
+```text
+C:\zapret\general (ALT12).bat
+```
+
+Именно через этот bat-файл скрипт будет запускать `winws.exe`.
+
+Если `general (ALT12).bat` лежит в другом месте, откройте `switchVPNzapret.vbs` обычным Блокнотом и в начале файла заполните строку:
+
+```vbscript
+batPath = "C:\ВАШ_ПУТЬ\general (ALT12).bat"
+```
+
+Если файл лежит в `C:\zapret\general (ALT12).bat`, оставьте:
+
+```vbscript
+batPath = ""
+```
+
+### 3. Ручная проверка ДО автозапуска
+
+Это нужно, чтобы понять: скрипт вообще может найти zapret и не падает ли он.
+
+1. Откройте меню Пуск.
+2. Напишите `PowerShell`.
+3. Нажмите **правой кнопкой** по Windows PowerShell.
+4. Выберите **Запуск от имени администратора**.
+5. Вставьте команду ниже и нажмите Enter:
 
 ```powershell
-# если батник не находится автопоиском — укажите путь явно:
+cd "C:\Tools\switchVPNzapret"
 powershell -NoProfile -ExecutionPolicy Bypass -File .\switchVPNzapret.ps1 -TestOnce -GeneralBat "C:\zapret\general (ALT12).bat"
 ```
-Смотрите результат в логе `%ProgramData%\zapret-vpn-switch\vpn-zapret.log`.
 
-### Удаление
+Если путь к папке другой — замените `C:\Tools\switchVPNzapret` и `C:\zapret\general (ALT12).bat` на свои.
 
-ПКМ по `uninstall_autostart.bat` → от администратора.
+Нормальный результат выглядит примерно так:
+
+```text
+TestOnce: Happ=False  winws=True  (подробности в C:\ProgramData\zapret-vpn-switch\vpn-zapret.log)
+```
+
+Что означают значения:
+
+| Значение | Что значит |
+|---|---|
+| `Happ=False` | Happ сейчас закрыт. Это нормально, если VPN не запущен. |
+| `Happ=True` | Happ сейчас открыт. |
+| `winws=True` | zapret / `winws.exe` работает. |
+| `winws=False` | `winws.exe` не работает. Если Happ закрыт — смотрите лог, возможно не найден `general (ALT12).bat`. |
+
+### 4. Как проверить процессы вручную
+
+Все команды ниже вставляйте в **PowerShell от имени администратора**.
+
+#### Проверить, запущен ли Happ
+
+```powershell
+Get-Process happ -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, Path
+```
+
+Если ничего не вывело — Happ закрыт или процесс называется иначе.
+
+#### Проверить, запущен ли zapret / winws
+
+```powershell
+Get-Process winws -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, Path
+```
+
+Если ничего не вывело — `winws.exe` сейчас не запущен.
+
+#### Проверить, жив ли сам фоновый скрипт
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -like '*switchVPNzapret.ps1*' } |
+  Select-Object ProcessId, CommandLine
+```
+
+Если команда что-то вывела — `switchVPNzapret.ps1` работает как фоновый процесс.
+
+#### Проверить `.vbs`-обёртку планировщика
+
+После установки автозапуска теперь обычно должен быть ещё и `wscript.exe`, который ждёт PowerShell:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" |
+  Where-Object { $_.CommandLine -like '*switchVPNzapret.vbs*' } |
+  Select-Object ProcessId, CommandLine
+```
+
+Если `powershell.exe` со `switchVPNzapret.ps1` есть, а `wscript.exe` нет — скрипт всё равно может работать, но планировщик хуже контролирует его перезапуск. В этой версии `wscript.exe` должен оставаться.
+
+#### Посмотреть лог
+
+```powershell
+Get-Content "C:\ProgramData\zapret-vpn-switch\vpn-zapret.log" -Tail 80
+```
+
+В логе должны быть строки вроде:
+
+```text
+=== switchVPNzapret запущен ... ===
+Конфиг zapret: C:\zapret\general (ALT12).bat
+Подписка на старт/останов процесса happ.exe оформлена.
+Страховочный таймер запущен ...
+```
+
+### 5. Правильная установка в автозапуск через планировщик
+
+Самый простой и правильный вариант:
+
+1. Откройте папку:
+   ```text
+   C:\Tools\switchVPNzapret\
+   ```
+2. Нажмите **правой кнопкой** по файлу:
+   ```text
+   install_autostart.bat
+   ```
+3. Выберите:
+   ```text
+   Запуск от имени администратора
+   ```
+4. Дождитесь сообщения `[OK]`.
+5. Перезагрузите компьютер или сразу проверьте задачу командами ниже.
+
+Что делает установщик:
+
+- создаёт задачу `SwitchVPNZapret`;
+- запускает её **при старте Windows**, до входа пользователя;
+- запускает от имени **SYSTEM**;
+- запускает не `.ps1` напрямую, а `switchVPNzapret.vbs`;
+- `.vbs` запускает PowerShell полностью скрыто, поэтому новых окон быть не должно;
+- у задачи отключён лимит времени выполнения (`ExecutionTimeLimit = PT0S`), поэтому она может работать постоянно.
+
+### 6. Проверка задачи планировщика
+
+Откройте **PowerShell от имени администратора** и выполните:
+
+```powershell
+schtasks /Query /TN "SwitchVPNZapret" /V /FO LIST
+```
+
+Что смотреть:
+
+| Поле | Нормально |
+|---|---|
+| `TaskName` / `Имя задачи` | `\SwitchVPNZapret` |
+| `Status` / `Состояние` | `Running` / `Выполняется` после установки и запуска |
+| `Task To Run` / `Выполняемая задача` | `wscript.exe "...\switchVPNzapret.vbs"` |
+| `Run As User` / `Запуск от имени` | `SYSTEM` или `NT AUTHORITY\SYSTEM` |
+
+Запустить задачу вручную:
+
+```powershell
+schtasks /Run /TN "SwitchVPNZapret"
+```
+
+Остановить задачу вручную:
+
+```powershell
+schtasks /End /TN "SwitchVPNZapret"
+```
+
+Удалить задачу вручную:
+
+```powershell
+schtasks /Delete /TN "SwitchVPNZapret" /F
+```
+
+### 7. Главный функциональный тест
+
+1. Убедитесь, что Happ закрыт.
+2. Проверьте `winws.exe`:
+   ```powershell
+   Get-Process winws -ErrorAction SilentlyContinue
+   ```
+   Когда Happ закрыт, `winws.exe` должен быть запущен.
+3. Запустите Happ.
+4. Через 1–3 секунды проверьте:
+   ```powershell
+   Get-Process winws -ErrorAction SilentlyContinue
+   ```
+   Теперь `winws.exe` должен пропасть.
+5. Закройте Happ полностью.
+6. Через 1–10 секунд снова проверьте:
+   ```powershell
+   Get-Process winws -ErrorAction SilentlyContinue
+   ```
+   `winws.exe` должен появиться обратно.
+
+### 8. Удаление автозапуска
+
+Самый простой вариант:
+
+1. ПКМ по `uninstall_autostart.bat`.
+2. **Запуск от имени администратора**.
+
+Или вручную из PowerShell / CMD от администратора:
+
+```powershell
+schtasks /End /TN "SwitchVPNZapret"
+schtasks /Delete /TN "SwitchVPNZapret" /F
+```
 
 ---
 
@@ -138,7 +342,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\switchVPNzapret.ps1 -TestO
 | Реестр `HKCU\...\Run` → `powershell.exe -WindowStyle Hidden` | Окно всё равно мелькает на долю секунды. Только текущий пользователь. |
 | **Task Scheduler, SYSTEM, BootTrigger, Hidden, через `.vbs`** | ✅ Запуск до входа. ✅ Окон нет вообще. ✅ Автоперезапуск при падении. ✅ Нет лимита по времени. |
 
-VBS-обёртка с `WScript.Shell.Run(..., 0, False)` — единственный надёжный способ запустить PowerShell вообще без мерцания окна.
+VBS-обёртка с `WScript.Shell.Run(..., 0, True)` — надёжный способ запустить PowerShell без мерцания окна и при этом оставить задачу планировщика в состоянии `Running`, пока фоновый скрипт жив.
 
 ---
 

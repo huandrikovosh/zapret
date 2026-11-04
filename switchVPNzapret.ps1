@@ -39,28 +39,28 @@ $ErrorActionPreference = 'Stop'
 # ---------------------- НАСТРОЙКИ ----------------------
 # Имена процессов VPN, при которых zapret нужно гасить (без .exe, как видит Get-Process).
 # Happ — основной. Можно дописать свои, если пользуетесь ещё чем-то.
-$VpnProcessNames = @(
+$global:VpnProcessNames = @(
     'happ',            # Happ
     'Happ'
 )
 
 # Имя файла нужного конфига zapret. ИМЕННО через него должен стартовать winws.exe.
-$GeneralBatName = 'general (ALT12).bat'
+$global:GeneralBatName = 'general (ALT12).bat'
 
 # Fallback-пути поиска general (ALT12).bat (если не найдём рядом со скриптом).
 # Поправьте под себя при необходимости.
-$GeneralBatFallbacks = @(
+$global:GeneralBatFallbacks = @(
     'C:\zapret\general (ALT12).bat',
     'C:\Tools\zapret\general (ALT12).bat'
 )
 
 # Имя службы zapret (на случай, если zapret всё же установлен как служба —
 # тогда её тоже останавливаем, чтобы она не перезапускала winws.exe).
-$ServiceName = 'zapret'
+$global:ServiceName = 'zapret'
 
-$LogDir  = Join-Path $env:ProgramData 'zapret-vpn-switch'
-$LogFile = Join-Path $LogDir 'vpn-zapret.log'
-$MaxLogBytes = 512KB
+$global:LogDir  = Join-Path $env:ProgramData 'zapret-vpn-switch'
+$global:LogFile = Join-Path $global:LogDir 'vpn-zapret.log'
+$global:MaxLogBytes = 512KB
 # ------------------------------------------------------
 
 # --- Один экземпляр через глобальный mutex ---
@@ -73,19 +73,19 @@ if (-not $createdNew) {
 }
 
 # --- Логи ---
-if (-not (Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+if (-not (Test-Path $global:LogDir)) {
+    New-Item -ItemType Directory -Path $global:LogDir -Force | Out-Null
 }
 function global:Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
     try {
-        if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt $MaxLogBytes)) {
-            $old = "$LogFile.1"
+        if ((Test-Path $global:LogFile) -and ((Get-Item $global:LogFile).Length -gt $global:MaxLogBytes)) {
+            $old = "$($global:LogFile).1"
             if (Test-Path $old) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
-            Rename-Item $LogFile $old -Force -ErrorAction SilentlyContinue
+            Rename-Item $global:LogFile $old -Force -ErrorAction SilentlyContinue
         }
         "$([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')) [$Level] $Message" |
-            Out-File -FilePath $LogFile -Append -Encoding UTF8
+            Out-File -FilePath $global:LogFile -Append -Encoding UTF8
     } catch { }
 }
 
@@ -101,9 +101,9 @@ $scriptDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } elseif ($
 $global:ZapretBatPath = $null
 $batCandidates = @()
 if ($GeneralBat) { $batCandidates += $GeneralBat }
-$batCandidates += (Join-Path $scriptDir $GeneralBatName)
-$batCandidates += (Join-Path $scriptDir ("zapret\" + $GeneralBatName))
-$batCandidates += $GeneralBatFallbacks
+$batCandidates += (Join-Path $scriptDir $global:GeneralBatName)
+$batCandidates += (Join-Path $scriptDir ("zapret\" + $global:GeneralBatName))
+$batCandidates += $global:GeneralBatFallbacks
 foreach ($c in $batCandidates) {
     if ($c -and (Test-Path -LiteralPath $c)) { $global:ZapretBatPath = (Resolve-Path -LiteralPath $c).Path; break }
 }
@@ -112,7 +112,7 @@ Write-Log "=== switchVPNzapret запущен (PID $PID, user=$([Environment]::U
 if ($global:ZapretBatPath) {
     Write-Log "Конфиг zapret: $($global:ZapretBatPath)"
 } else {
-    Write-Log "НЕ найден '$GeneralBatName'. Задайте путь через -GeneralBat или поправьте \$GeneralBatFallbacks." 'ERROR'
+    Write-Log "НЕ найден '$($global:GeneralBatName)'. Задайте путь через -GeneralBat или поправьте \$global:GeneralBatFallbacks." 'ERROR'
 }
 
 # ======================================================
@@ -121,7 +121,7 @@ if ($global:ZapretBatPath) {
 
 function global:Test-HappRunning {
     # Главный триггер: запущен ли процесс Happ.
-    foreach ($n in $VpnProcessNames) {
+    foreach ($n in $global:VpnProcessNames) {
         if (@(Get-Process -Name $n -ErrorAction SilentlyContinue).Count -gt 0) {
             return $true
         }
@@ -166,17 +166,17 @@ function global:Kill-Winws {
 
 function global:Stop-Zapret {
     # 1) Если zapret установлен службой — останавливаем её, иначе она перезапустит winws.
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $svc = Get-Service -Name $global:ServiceName -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -ne 'Stopped') {
         try {
-            $null = & sc.exe stop $ServiceName 2>&1
+            $null = & sc.exe stop $global:ServiceName 2>&1
             for ($i = 0; $i -lt 5; $i++) {
                 try { $svc.Refresh() } catch { }
                 if ($svc.Status -eq 'Stopped') { break }
                 Start-Sleep -Milliseconds 500
             }
         } catch {
-            Write-Log "sc stop ${ServiceName} упал: $($_.Exception.Message)" 'WARN'
+            Write-Log "sc stop $($global:ServiceName) упал: $($_.Exception.Message)" 'WARN'
         }
     }
 
@@ -198,7 +198,7 @@ function global:Start-Zapret {
     }
 
     if (-not $global:ZapretBatPath) {
-        Write-Log "Путь к '$GeneralBatName' не задан — zapret не запустить. Укажите -GeneralBat." 'ERROR'
+        Write-Log "Путь к '$($global:GeneralBatName)' не задан — zapret не запустить. Укажите -GeneralBat." 'ERROR'
         return
     }
     if (-not (Test-Path -LiteralPath $global:ZapretBatPath)) {
@@ -237,11 +237,12 @@ function global:Start-Zapret {
 
 # --- Сериализация Sync-State: защита от гонки WMI-событие vs таймер ---
 # Лок обязан быть ГЛОБАЛЬНЫМ — Action-блоки событий выполняются в отдельном scope,
-# где переменные уровня $script: не видны.
-$global:SwitchVpnSyncLock = [ref]0
+# где переменные уровня $script: не видны. SemaphoreSlim не ломает старт скрипта,
+# в отличие от некорректной передачи [ref] в Interlocked.
+$global:SwitchVpnSyncSemaphore = [System.Threading.SemaphoreSlim]::new(1, 1)
 
 function global:Sync-State {
-    if ([System.Threading.Interlocked]::CompareExchange($global:SwitchVpnSyncLock, 1, 0) -ne 0) {
+    if (-not $global:SwitchVpnSyncSemaphore.Wait(0)) {
         return
     }
     try {
@@ -253,7 +254,7 @@ function global:Sync-State {
             Stop-Zapret
         } elseif ($happUp -and -not $winwsRunning) {
             # Happ работает, winws нет — но служба могла остаться и перезапустит winws.
-            $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            $svc = Get-Service -Name $global:ServiceName -ErrorAction SilentlyContinue
             if ($svc -and $svc.Status -ne 'Stopped') {
                 Write-Log "Happ запущен, winws нет, но служба в статусе $($svc.Status) — останавливаю." 'DEBUG'
                 Stop-Zapret
@@ -265,7 +266,7 @@ function global:Sync-State {
         # Иначе (Happ закрыт + winws работает) — корректное состояние, ничего не делаем.
     }
     finally {
-        [System.Threading.Interlocked]::Exchange($global:SwitchVpnSyncLock, 0) | Out-Null
+        [void]$global:SwitchVpnSyncSemaphore.Release()
     }
 }
 
@@ -277,7 +278,7 @@ if ($TestOnce) {
     $happ  = Test-HappRunning
     $winws = ((Get-WinwsProcesses).Count -gt 0)
     Write-Log "TestOnce завершён. Happ=$happ  winws=$winws"
-    Write-Host "TestOnce: Happ=$happ  winws=$winws  (подробности в $LogFile)"
+    Write-Host "TestOnce: Happ=$happ  winws=$winws  (подробности в $($global:LogFile))"
     if ($mutex) { try { $mutex.ReleaseMutex() } catch {}; $mutex.Dispose() }
     exit 0
 }
